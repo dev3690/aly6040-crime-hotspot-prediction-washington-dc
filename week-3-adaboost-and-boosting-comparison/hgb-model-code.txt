@@ -1,0 +1,172 @@
+import time
+import numpy as np
+import pandas as pd
+
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+
+def eval_binary_classifier(name, model, Xtr, ytr, Xte, yte):
+    start = time.perf_counter()
+    model.fit(Xtr, ytr)
+    train_time = time.perf_counter() - start
+
+    pred = model.predict(Xte)
+
+    # HistGradientBoostingClassifier uses decision_function; convert to probability-like score
+    # If predict_proba exists, use it; otherwise use decision_function + sigmoid
+    proba = None
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(Xte)[:, 1]
+    elif hasattr(model, "decision_function"):
+        scores = model.decision_function(Xte)
+        proba = 1 / (1 + np.exp(-scores))  # sigmoid
+
+    return {
+        "Model": name,
+        "Accuracy": accuracy_score(yte, pred),
+        "Precision": precision_score(yte, pred, zero_division=0),
+        "Recall": recall_score(yte, pred, zero_division=0),
+        "F1": f1_score(yte, pred, zero_division=0),
+        "ROC_AUC": roc_auc_score(yte, proba) if proba is not None else np.nan,
+        "Train_Time_sec": train_time,
+        "Fitted_Model": model
+    }
+
+# Baseline HGB (keep it simple for Week-2)
+hgb = HistGradientBoostingClassifier(
+    learning_rate=0.1,
+    max_depth=6,
+    max_iter=300,        # number of boosting iterations
+    random_state=42
+)
+
+hgb_result = eval_binary_classifier("HistGB (Baseline)", hgb, X_train_enc, y_train, X_test_enc, y_test)
+
+pd.DataFrame([{k:v for k,v in hgb_result.items() if k != "Fitted_Model"}])
+
+
+
+from sklearn.model_selection import GridSearchCV
+
+hgb_grid = {
+    "learning_rate": [0.05, 0.1],
+    "max_depth": [3, 5, 7, None],
+    "max_iter": [200, 400],
+    "min_samples_leaf": [10, 30, 60],
+    "l2_regularization": [0.0, 0.1, 1.0]
+}
+
+hgb_base = HistGradientBoostingClassifier(random_state=42)
+
+start = time.perf_counter()
+hgb_gs = GridSearchCV(hgb_base, hgb_grid, scoring="f1", cv=3, n_jobs=-1)
+hgb_gs.fit(X_train_enc, y_train)
+tune_time = time.perf_counter() - start
+
+best_hgb = hgb_gs.best_estimator_
+pred = best_hgb.predict(X_test_enc)
+
+# probability-like scores for AUC
+if hasattr(best_hgb, "predict_proba"):
+    proba = best_hgb.predict_proba(X_test_enc)[:, 1]
+else:
+    scores = best_hgb.decision_function(X_test_enc)
+    proba = 1 / (1 + np.exp(-scores))
+
+hgb_tuned_result = {
+    "Model": "HistGB (Tuned)",
+    "Best_Params": hgb_gs.best_params_,
+    "Accuracy": accuracy_score(y_test, pred),
+    "Precision": precision_score(y_test, pred, zero_division=0),
+    "Recall": recall_score(y_test, pred, zero_division=0),
+    "F1": f1_score(y_test, pred, zero_division=0),
+    "ROC_AUC": roc_auc_score(y_test, proba),
+    "Tuning_Time_sec": tune_time,
+    "Fitted_Model": best_hgb
+}
+
+pd.DataFrame([{k:v for k,v in hgb_tuned_result.items() if k != "Fitted_Model"}])
+
+
+
+import matplotlib.pyplot as plt
+from sklearn.inspection import permutation_importance
+
+# Use tuned HGB if available; else baseline
+model_for_explain = best_hgb if "best_hgb" in globals() else hgb_result["Fitted_Model"]
+
+perm = permutation_importance(
+    model_for_explain,
+    X_test_enc,
+    y_test,
+    n_repeats=10,
+    random_state=42,
+    n_jobs=-1,
+    scoring="f1"
+)
+
+imp = pd.Series(perm.importances_mean, index=X_test_enc.columns).sort_values(ascending=False).head(20)
+
+plt.figure(figsize=(10, 6))
+plt.barh(imp.index[::-1], imp.values[::-1])
+plt.title("Feature Importance (Permutation) — HistGradientBoosting (Top 20)")
+plt.xlabel("Mean importance (ΔF1)")
+plt.tight_layout()
+plt.show()
+
+
+
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, precision_recall_curve, average_precision_score
+
+def get_proba_or_score(model, X):
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
+    if hasattr(model, "decision_function"):
+        scores = model.decision_function(X)
+        return 1 / (1 + np.exp(-scores))
+    # fallback (not ideal): use predictions as scores
+    return model.predict(X)
+
+# Choose which set to plot (baseline results or tuned results)
+plot_models = []
+
+# Example: plot tuned models if available
+if "tuned_results" in globals() and len(tuned_results) > 0:
+    plot_models = tuned_results
+else:
+    plot_models = results
+
+# ROC curves
+plt.figure(figsize=(8, 6))
+for r in plot_models:
+    model = r["Fitted_Model"]
+    y_score = get_proba_or_score(model, X_test_enc)
+    fpr, tpr, _ = roc_curve(y_test, y_score)
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, label=f"{r['Model']} (AUC={roc_auc:.3f})")
+
+plt.plot([0, 1], [0, 1], linestyle="--")
+plt.title("ROC Curves (Test Set)")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# PR curves
+plt.figure(figsize=(8, 6))
+for r in plot_models:
+    model = r["Fitted_Model"]
+    y_score = get_proba_or_score(model, X_test_enc)
+    precision, recall, _ = precision_recall_curve(y_test, y_score)
+    ap = average_precision_score(y_test, y_score)
+    plt.plot(recall, precision, label=f"{r['Model']} (AP={ap:.3f})")
+
+plt.title("Precision–Recall Curves (Test Set)")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.legend()
+plt.tight_layout()
+plt.show()
